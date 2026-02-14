@@ -139,6 +139,17 @@ def _pair_key(a: str, b: str) -> tuple[str, str]:
     return (a, b) if _horse_sort_key(a) <= _horse_sort_key(b) else (b, a)
 
 
+def _add_spread_column(df: pd.DataFrame, odds_columns: list[str], column_name: str = "差異幅") -> pd.DataFrame:
+    frame = df.copy()
+    if frame.empty:
+        frame[column_name] = []
+        return frame
+
+    numeric = frame[odds_columns].apply(pd.to_numeric, errors="coerce")
+    frame[column_name] = (numeric.max(axis=1) - numeric.min(axis=1)).round(4)
+    return frame
+
+
 def _build_pair_compare(
     umaren: pd.DataFrame | None,
     umatan: pd.DataFrame | None,
@@ -180,6 +191,7 @@ def _build_pair_compare(
         ab = umatan_dir_map.get((a, b))
         ba = umatan_dir_map.get((b, a))
         synth_umatan = _synthetic_odds([x for x in [ab, ba] if x is not None])
+        compare_umatan = (synth_umatan / 2.0) if synth_umatan is not None else None
         umaren_odd = umaren_map.get((a, b))
         pair_rows.append(
             {
@@ -188,11 +200,14 @@ def _build_pair_compare(
                 "馬番B": int(b) if b.isdigit() else b,
                 "馬名B": horse_name_map.get(b, ""),
                 "馬連オッズ": round(umaren_odd, 4) if umaren_odd is not None else None,
-                "馬単表裏合成オッズ": round(synth_umatan, 4) if synth_umatan is not None else None,
+                "馬単表裏合成オッズ": round(compare_umatan, 4) if compare_umatan is not None else None,
             }
         )
 
-    return pd.DataFrame(pair_rows)
+    pair_df = pd.DataFrame(pair_rows)
+    if pair_df.empty:
+        return pair_df
+    return _add_spread_column(pair_df, ["馬連オッズ", "馬単表裏合成オッズ"])
 
 
 def predict_from_csv_dir(csv_dir: str | Path, excluded_horses: list[str] | None = None) -> PredictionResult:
@@ -239,16 +254,39 @@ def predict_from_csv_dir(csv_dir: str | Path, excluded_horses: list[str] | None 
     all_market_compare["三連単(2着流し)合成オッズ"] = all_market_compare["馬番"].astype(str).map(sanrentan_second)
     all_market_compare["三連単(3着流し)合成オッズ"] = all_market_compare["馬番"].astype(str).map(sanrentan_third)
     all_market_compare["馬番"] = pd.to_numeric(all_market_compare["馬番"], errors="coerce").astype("Int64")
+    all_market_compare = _add_spread_column(
+        all_market_compare,
+        [
+            "単勝オッズ",
+            "複勝オッズ",
+            "馬連流し合成オッズ",
+            "ワイド流し合成オッズ",
+            "馬単(1着流し)合成オッズ",
+            "馬単(2着流し)合成オッズ",
+            "三連複流し合成オッズ",
+            "三連単(1着流し)合成オッズ",
+            "三連単(2着流し)合成オッズ",
+            "三連単(3着流し)合成オッズ",
+        ],
+    )
 
     first_place_compare = master[["馬番", "馬名", "単勝オッズ"]].copy()
     first_place_compare["馬単(1着流し)合成オッズ"] = first_place_compare["馬番"].astype(str).map(umatan_first)
     first_place_compare["三連単(1着流し)合成オッズ"] = first_place_compare["馬番"].astype(str).map(sanrentan_first)
     first_place_compare["馬番"] = pd.to_numeric(first_place_compare["馬番"], errors="coerce").astype("Int64")
+    first_place_compare = _add_spread_column(
+        first_place_compare,
+        ["単勝オッズ", "馬単(1着流し)合成オッズ", "三連単(1着流し)合成オッズ"],
+    )
 
     flow_compare = master[["馬番", "馬名", "単勝オッズ"]].copy()
     flow_compare["馬連流し合成オッズ"] = flow_compare["馬番"].astype(str).map(umaren_flow)
     flow_compare["三連複流し合成オッズ"] = flow_compare["馬番"].astype(str).map(sanrenpuku_flow)
     flow_compare["馬番"] = pd.to_numeric(flow_compare["馬番"], errors="coerce").astype("Int64")
+    flow_compare = _add_spread_column(
+        flow_compare,
+        ["単勝オッズ", "馬連流し合成オッズ", "三連複流し合成オッズ"],
+    )
 
     pair_compare = _build_pair_compare(
         frames.get("馬連"),
@@ -256,6 +294,17 @@ def predict_from_csv_dir(csv_dir: str | Path, excluded_horses: list[str] | None 
         horse_name_map,
         excluded,
     )
+
+    excluded_num = {int(x) for x in excluded if x.isdigit()}
+
+    if excluded_num:
+        all_market_compare = all_market_compare[~all_market_compare["馬番"].isin(excluded_num)].reset_index(drop=True)
+        first_place_compare = first_place_compare[~first_place_compare["馬番"].isin(excluded_num)].reset_index(drop=True)
+        flow_compare = flow_compare[~flow_compare["馬番"].isin(excluded_num)].reset_index(drop=True)
+        if not pair_compare.empty:
+            pair_compare = pair_compare[
+                (~pair_compare["馬番A"].isin(excluded_num)) & (~pair_compare["馬番B"].isin(excluded_num))
+            ].reset_index(drop=True)
 
     return PredictionResult(
         all_market_compare=all_market_compare,
