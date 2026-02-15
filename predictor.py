@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 import pandas as pd
 
 
 BET_TYPES = ["単勝", "複勝", "枠連", "馬連", "ワイド", "馬単", "三連複", "三連単"]
+
+CSV_NAME_CANDIDATES = {
+    "単勝": ["win.csv", "単勝.csv"],
+    "複勝": ["place.csv", "複勝.csv"],
+    "枠連": ["bracket_quinella.csv", "枠連.csv"],
+    "馬連": ["quinella.csv", "馬連.csv"],
+    "ワイド": ["quinella_place.csv", "ワイド.csv"],
+    "馬単": ["exacta.csv", "馬単.csv"],
+    "三連複": ["trio.csv", "三連複.csv"],
+    "三連単": ["trifecta.csv", "三連単.csv"],
+}
 
 
 @dataclass
@@ -48,15 +60,34 @@ def _load_csv_map(csv_dir: Path) -> tuple[dict[str, pd.DataFrame], list[str]]:
     frames: dict[str, pd.DataFrame] = {}
     loaded_files: list[str] = []
     for bet_type in BET_TYPES:
-        file_path = csv_dir / f"{bet_type}.csv"
-        if not file_path.exists() or file_path.stat().st_size == 0:
-            continue
-        frame = pd.read_csv(file_path)
-        if frame.empty:
-            continue
-        frames[bet_type] = frame
-        loaded_files.append(str(file_path))
+        candidates = CSV_NAME_CANDIDATES.get(bet_type, [f"{bet_type}.csv"])
+        for file_name in candidates:
+            file_path = csv_dir / file_name
+            if not file_path.exists() or file_path.stat().st_size == 0:
+                continue
+            frame = pd.read_csv(file_path)
+            if frame.empty:
+                continue
+            frames[bet_type] = frame
+            loaded_files.append(str(file_path))
+            break
     return frames, loaded_files
+
+
+def _resolve_csv_dir(base_dir: Path) -> Path:
+    if not base_dir.exists():
+        raise FileNotFoundError(f"CSVディレクトリが見つかりません: {base_dir}")
+
+    direct_win = (base_dir / "win.csv").exists() or (base_dir / "単勝.csv").exists()
+    if direct_win:
+        return base_dir
+
+    nested_csv_dir = base_dir / "csv"
+    nested_win = (nested_csv_dir / "win.csv").exists() or (nested_csv_dir / "単勝.csv").exists()
+    if nested_win:
+        return nested_csv_dir
+
+    return base_dir
 
 
 def _combo_numbers(combo: object) -> list[str]:
@@ -78,12 +109,12 @@ def _horse_sort_key(horse_no: str) -> int:
     return int(horse_no) if horse_no.isdigit() else 9999
 
 
-def _build_horse_master(tansho: pd.DataFrame, excluded: set[str]) -> pd.DataFrame:
-    if not {"馬番", "馬名", "オッズ"}.issubset(set(tansho.columns)):
-        raise ValueError("単勝.csv に必要な列（馬番, 馬名, オッズ）がありません。")
+def _build_horse_master(base_frame: pd.DataFrame, excluded: set[str], tansho_map: dict[str, float | None]) -> pd.DataFrame:
+    if not {"馬番", "馬名"}.issubset(set(base_frame.columns)):
+        raise ValueError("馬番/馬名の列を含むCSV（win.csv または place.csv）が必要です。")
 
     rows: list[dict[str, object]] = []
-    for _, row in tansho.iterrows():
+    for _, row in base_frame.iterrows():
         horse_no = str(row.get("馬番", "")).strip()
         if not horse_no or horse_no in excluded:
             continue
@@ -91,7 +122,7 @@ def _build_horse_master(tansho: pd.DataFrame, excluded: set[str]) -> pd.DataFram
             {
                 "馬番": horse_no,
                 "馬名": str(row.get("馬名", "")).strip(),
-                "単勝オッズ": _parse_odds_value(row.get("オッズ")),
+                "単勝オッズ": tansho_map.get(horse_no),
             }
         )
 
@@ -101,6 +132,45 @@ def _build_horse_master(tansho: pd.DataFrame, excluded: set[str]) -> pd.DataFram
     master["馬番_num"] = pd.to_numeric(master["馬番"], errors="coerce")
     master = master.sort_values(by=["馬番_num"]).reset_index(drop=True)
     return master
+
+
+def _load_horse_master_from_race_json(base_dir: Path, excluded: set[str], tansho_map: dict[str, float | None]) -> pd.DataFrame | None:
+    race_json = base_dir.parent / "race_data.json"
+    if not race_json.exists():
+        return None
+
+    try:
+        data = json.loads(race_json.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return None
+
+    rows: list[dict[str, object]] = []
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        horse_no = str(row.get("馬番", row.get("col_2", ""))).strip()
+        horse_name = str(row.get("馬名", row.get("col_4", ""))).strip()
+        if not horse_no or not horse_name or horse_no in excluded:
+            continue
+        rows.append(
+            {
+                "馬番": horse_no,
+                "馬名": horse_name,
+                "単勝オッズ": tansho_map.get(horse_no),
+            }
+        )
+
+    if not rows:
+        return None
+
+    frame = pd.DataFrame(rows).drop_duplicates(subset=["馬番"], keep="first")
+    frame["馬番_num"] = pd.to_numeric(frame["馬番"], errors="coerce")
+    frame = frame.sort_values(by=["馬番_num"]).reset_index(drop=True)
+    return frame
 
 
 def _collect_horse_flow_odds(
@@ -191,7 +261,6 @@ def _build_pair_compare(
         ab = umatan_dir_map.get((a, b))
         ba = umatan_dir_map.get((b, a))
         synth_umatan = _synthetic_odds([x for x in [ab, ba] if x is not None])
-        compare_umatan = (synth_umatan / 2.0) if synth_umatan is not None else None
         umaren_odd = umaren_map.get((a, b))
         pair_rows.append(
             {
@@ -200,7 +269,7 @@ def _build_pair_compare(
                 "馬番B": int(b) if b.isdigit() else b,
                 "馬名B": horse_name_map.get(b, ""),
                 "馬連オッズ": round(umaren_odd, 4) if umaren_odd is not None else None,
-                "馬単表裏合成オッズ": round(compare_umatan, 4) if compare_umatan is not None else None,
+                "馬単表裏合成オッズ": round(synth_umatan, 4) if synth_umatan is not None else None,
             }
         )
 
@@ -211,18 +280,34 @@ def _build_pair_compare(
 
 
 def predict_from_csv_dir(csv_dir: str | Path, excluded_horses: list[str] | None = None) -> PredictionResult:
-    base_dir = Path(csv_dir)
-    if not base_dir.exists():
-        raise FileNotFoundError(f"CSVディレクトリが見つかりません: {base_dir}")
+    base_dir = _resolve_csv_dir(Path(csv_dir))
 
     excluded = {str(x).strip() for x in (excluded_horses or []) if str(x).strip()}
 
     frames, loaded_files = _load_csv_map(base_dir)
     tansho = frames.get("単勝")
-    if tansho is None or tansho.empty:
-        raise ValueError("単勝.csv が必要です。")
+    place = frames.get("複勝")
 
-    master = _build_horse_master(tansho, excluded)
+    tansho_map: dict[str, float | None] = {}
+    if tansho is not None and not tansho.empty and {"馬番", "オッズ"}.issubset(set(tansho.columns)):
+        for _, row in tansho.iterrows():
+            horse_no = str(row.get("馬番", "")).strip()
+            if horse_no:
+                tansho_map[horse_no] = _parse_odds_value(row.get("オッズ"))
+
+    base_frame = None
+    if tansho is not None and not tansho.empty and {"馬番", "馬名"}.issubset(set(tansho.columns)):
+        base_frame = tansho
+    elif place is not None and not place.empty and {"馬番", "馬名"}.issubset(set(place.columns)):
+        base_frame = place
+
+    if base_frame is None:
+        fallback_master = _load_horse_master_from_race_json(base_dir, excluded, tansho_map)
+        if fallback_master is None:
+            raise ValueError(f"win.csv/place.csv（または単勝.csv/複勝.csv）に馬番・馬名が必要です。入力: {base_dir}")
+        master = fallback_master
+    else:
+        master = _build_horse_master(base_frame, excluded, tansho_map)
     horse_numbers = [str(x) for x in master["馬番"].tolist()]
     horse_name_map = {str(row["馬番"]): row["馬名"] for _, row in master.iterrows()}
 
@@ -236,7 +321,7 @@ def predict_from_csv_dir(csv_dir: str | Path, excluded_horses: list[str] | None 
     sanrenpuku_flow = _collect_horse_flow_odds(frames.get("三連複"), horse_numbers, excluded, mode="contains")
 
     fukusho_map: dict[str, float | None] = {}
-    fukusho = frames.get("複勝")
+    fukusho = place
     if fukusho is not None and not fukusho.empty and {"馬番", "オッズ"}.issubset(set(fukusho.columns)):
         for _, row in fukusho.iterrows():
             horse_no = str(row.get("馬番", "")).strip()
@@ -279,13 +364,13 @@ def predict_from_csv_dir(csv_dir: str | Path, excluded_horses: list[str] | None 
         ["単勝オッズ", "馬単(1着流し)合成オッズ", "三連単(1着流し)合成オッズ"],
     )
 
-    flow_compare = master[["馬番", "馬名", "単勝オッズ"]].copy()
-    flow_compare["馬連流し合成オッズ"] = flow_compare["馬番"].astype(str).map(umaren_flow)
+    flow_compare = master[["馬番", "馬名"]].copy()
+    flow_compare["複勝オッズ"] = flow_compare["馬番"].astype(str).map(fukusho_map)
     flow_compare["三連複流し合成オッズ"] = flow_compare["馬番"].astype(str).map(sanrenpuku_flow)
     flow_compare["馬番"] = pd.to_numeric(flow_compare["馬番"], errors="coerce").astype("Int64")
     flow_compare = _add_spread_column(
         flow_compare,
-        ["単勝オッズ", "馬連流し合成オッズ", "三連複流し合成オッズ"],
+        ["複勝オッズ", "三連複流し合成オッズ"],
     )
 
     pair_compare = _build_pair_compare(

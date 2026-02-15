@@ -69,21 +69,8 @@ if run:
                 st.write(file_path)
 
         st.subheader("全券種比較テーブル（全馬）")
-        all_market_sort = st.checkbox("全券種比較を差異幅でソート", value=False)
-        all_market_view = _sorted_by_spread(result.all_market_compare) if all_market_sort else result.all_market_compare
-        all_market_odds_cols = [
-            "単勝オッズ",
-            "複勝オッズ",
-            "馬連流し合成オッズ",
-            "ワイド流し合成オッズ",
-            "馬単(1着流し)合成オッズ",
-            "馬単(2着流し)合成オッズ",
-            "三連複流し合成オッズ",
-            "三連単(1着流し)合成オッズ",
-            "三連単(2着流し)合成オッズ",
-            "三連単(3着流し)合成オッズ",
-        ]
-        st.dataframe(_style_compare_table(all_market_view, all_market_odds_cols), use_container_width=True, hide_index=True)
+        all_market_view = result.all_market_compare.drop(columns=["差異幅"], errors="ignore")
+        st.dataframe(all_market_view, use_container_width=True, hide_index=True)
 
         st.subheader("比較1: 単勝 vs 馬単1着流し vs 三連単1着流し")
         first_sort = st.checkbox("比較1を差異幅でソート", value=True)
@@ -91,10 +78,10 @@ if run:
         first_odds_cols = ["単勝オッズ", "馬単(1着流し)合成オッズ", "三連単(1着流し)合成オッズ"]
         st.dataframe(_style_compare_table(first_view, first_odds_cols), use_container_width=True, hide_index=True)
 
-        st.subheader("比較2: 単勝 vs 馬連流し vs 三連複流し")
+        st.subheader("比較2: 複勝 vs 三連複流し")
         flow_sort = st.checkbox("比較2を差異幅でソート", value=True)
         flow_view = _sorted_by_spread(result.flow_compare) if flow_sort else result.flow_compare
-        flow_odds_cols = ["単勝オッズ", "馬連流し合成オッズ", "三連複流し合成オッズ"]
+        flow_odds_cols = ["複勝オッズ", "三連複流し合成オッズ"]
         st.dataframe(_style_compare_table(flow_view, flow_odds_cols), use_container_width=True, hide_index=True)
 
         st.subheader("比較3: 馬連 vs 馬単裏表")
